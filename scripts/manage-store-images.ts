@@ -15,7 +15,11 @@ const LIST_HEADER =
 // Conversion settings (AVIF via avifenc, resize via ImageMagick).
 const MAX_PIXELS = 1400000; // 1.4 Megapixels
 const MAX_FILE_SIZE = 200 * 1024; // 200 KB
+// Small variant ("<id>.s.avif"): ~0.12 MP thumbnail.
+const SMALL_MAX_PIXELS = 120000; // 0.12 Megapixels
+const SMALL_MAX_FILE_SIZE = 40 * 1024; // 40 KB
 const INITIAL_QUALITY = 80;
+const SMALL_INITIAL_QUALITY = 75; // starting quality for small thumbnails
 const MIN_QUALITY = 65; // Quality floor
 const SPEED = 2; // avifenc speed 0..10 (0 = slowest, best compression)
 
@@ -85,11 +89,12 @@ function printCategories() {
 }
 
 /**
- * Converts a source image to a <id>.avif at destPath: resize to the 1.4MP cap
- * with magick into a temp PNG, then avifenc with a quality loop down to the
- * floor. Returns the final file size in bytes. Throws on failure.
+ * Converts a source image to an AVIF at destPath: resize to maxPixels with
+ * magick into a temp PNG, then avifenc with a quality loop down to the floor
+ * until the result fits maxFileSize. Returns the final file size in bytes.
+ * Throws on failure.
  */
-function convertToAvif(srcPath: string, destPath: string): number {
+function convertToAvif(srcPath: string, destPath: string, maxPixels: number, maxFileSize: number, initialQuality: number = INITIAL_QUALITY): number {
   const hasAvifenc = checkBinary('avifenc');
   const hasMagick = checkBinary('magick') || checkBinary('convert');
   const magickCmd = checkBinary('magick') ? 'magick' : 'convert';
@@ -99,15 +104,25 @@ function convertToAvif(srcPath: string, destPath: string): number {
 
   let encodeInput = srcPath;
   let tempInput = '';
+  let tempDecoded = '';
   try {
+    // magick/avifenc can't read AVIF here (no decode delegate). When the input
+    // is an AVIF, decode it to PNG with avifdec first and work from that.
+    if (path.extname(srcPath).toLowerCase() === '.avif' && checkBinary('avifdec')) {
+      tempDecoded = path.join(os.tmpdir(), `genix-dec-${process.pid}-${maxPixels}.png`);
+      const dec = spawnSync('avifdec', [srcPath, tempDecoded], { encoding: 'utf8' });
+      if (dec.status === 0 && fs.existsSync(tempDecoded)) encodeInput = tempDecoded;
+      else tempDecoded = '';
+    }
+
     if (hasAvifenc && hasMagick) {
-      tempInput = path.join(os.tmpdir(), `genix-opt-${process.pid}.png`);
-      const resize = spawnSync(magickCmd, [srcPath, '-resize', `${MAX_PIXELS}@>`, tempInput]);
+      tempInput = path.join(os.tmpdir(), `genix-opt-${process.pid}-${maxPixels}.png`);
+      const resize = spawnSync(magickCmd, [encodeInput, '-resize', `${maxPixels}@>`, tempInput]);
       if (resize.status === 0 && fs.existsSync(tempInput)) encodeInput = tempInput;
       else tempInput = '';
     }
 
-    let q = INITIAL_QUALITY;
+    let q = initialQuality;
     while (true) {
       if (hasAvifenc) {
         const res = spawnSync('avifenc',
@@ -116,16 +131,16 @@ function convertToAvif(srcPath: string, destPath: string): number {
         if (res.status !== 0) throw new Error(`avifenc failed: ${res.stderr || res.stdout || res.status}`);
       } else {
         const res = spawnSync(magickCmd,
-          [srcPath, '-resize', `${MAX_PIXELS}@>`, '-quality', String(q), destPath]);
+          [encodeInput, '-resize', `${maxPixels}@>`, '-quality', String(q), destPath]);
         if (res.status !== 0) throw new Error(`magick failed: ${res.status}`);
       }
       const size = fs.statSync(destPath).size;
-      if (size <= MAX_FILE_SIZE || q <= MIN_QUALITY) return size;
+      if (size <= maxFileSize || q <= MIN_QUALITY) return size;
       q = Math.max(MIN_QUALITY, q - 5);
     }
   } finally {
-    if (tempInput && fs.existsSync(tempInput)) {
-      try { fs.unlinkSync(tempInput); } catch {}
+    for (const t of [tempInput, tempDecoded]) {
+      if (t && fs.existsSync(t)) { try { fs.unlinkSync(t); } catch {} }
     }
   }
 }
@@ -177,20 +192,31 @@ function processImage() {
   const parsed = path.parse(source);
   const id = readCounter() + 1;
   const avifName = `${id}.avif`;
+  const smallName = `${id}.s.avif`;
   const destPath = path.join(IMAGES_DIR, category, avifName);
+  const smallPath = path.join(IMAGES_DIR, category, smallName);
 
   if (fs.existsSync(destPath)) {
     console.error(`❌ ${category}/${avifName} already exists — id collision`);
     process.exit(1);
   }
+  if (fs.existsSync(smallPath)) {
+    console.error(`❌ ${category}/${smallName} already exists — id collision`);
+    process.exit(1);
+  }
 
-  // 1) Convert into the category folder.
+  // 1) Convert into the category folder: the full-size image and a small
+  //    (~0.16 MP) thumbnail variant named "<id>.s.avif".
   let size: number;
+  let smallSize: number;
   try {
-    size = convertToAvif(srcPath, destPath);
+    size = convertToAvif(srcPath, destPath, MAX_PIXELS, MAX_FILE_SIZE);
     console.log(`✨ ${source} -> ${category}/${avifName} (${(size / 1024).toFixed(1)} KB)`);
+    smallSize = convertToAvif(srcPath, smallPath, SMALL_MAX_PIXELS, SMALL_MAX_FILE_SIZE, SMALL_INITIAL_QUALITY);
+    console.log(`✨ ${source} -> ${category}/${smallName} (${(smallSize / 1024).toFixed(1)} KB)`);
   } catch (e) {
     if (fs.existsSync(destPath)) { try { fs.unlinkSync(destPath); } catch {} }
+    if (fs.existsSync(smallPath)) { try { fs.unlinkSync(smallPath); } catch {} }
     console.error(`❌ Conversion failed: ${e}`);
     process.exit(1);
   }
@@ -211,6 +237,83 @@ function processImage() {
   console.log(`   ↳ source marked: ${source} -> ${id}--${parsed.name}${parsed.ext} | counter -> ${id}`);
 }
 
+/** Maps each processed id to its marked source path ("<id>--<name>.<ext>"). */
+function markedSourcesById(): Map<string, string> {
+  const map = new Map<string, string>();
+  if (!fs.existsSync(SOURCE_DIR)) return map;
+  for (const f of fs.readdirSync(SOURCE_DIR)) {
+    const m = f.match(/^(\d+)--/);
+    if (m && SOURCE_EXTS.includes(path.extname(f).toLowerCase())) map.set(m[1], path.join(SOURCE_DIR, f));
+  }
+  return map;
+}
+
+/**
+ * --fill-small: Scans every category folder for full-size "<id>.avif" files
+ * that lack their "<id>.s.avif" thumbnail and generates the missing small
+ * variant. Prefers the original marked source ("<id>--<name>.<ext>" in
+ * images-source/) as input — same as --process — and falls back to the
+ * full-size AVIF only if the source is gone. Idempotent: re-running only
+ * creates what is missing.
+ */
+function fillSmall() {
+  // Matches "<id>.avif" but not the small "<id>.s.avif".
+  const FULL_RE = /^(\d+)\.avif$/;
+  const sources = markedSourcesById();
+  let created = 0;
+  let failed = 0;
+  let skipped = 0;
+
+  for (const category of getCategories()) {
+    const dir = path.join(IMAGES_DIR, category);
+    const files = fs.readdirSync(dir).filter(f => FULL_RE.test(f));
+    for (const file of files) {
+      const id = file.match(FULL_RE)![1];
+      const smallName = `${id}.s.avif`;
+      const smallPath = path.join(dir, smallName);
+      if (fs.existsSync(smallPath)) {
+        skipped++;
+        continue;
+      }
+      const input = sources.get(id) ?? path.join(dir, file);
+      try {
+        const smallSize = convertToAvif(input, smallPath, SMALL_MAX_PIXELS, SMALL_MAX_FILE_SIZE, SMALL_INITIAL_QUALITY);
+        created++;
+        console.log(`✨ ${category}/${smallName} (${(smallSize / 1024).toFixed(1)} KB)`);
+      } catch (e) {
+        if (fs.existsSync(smallPath)) { try { fs.unlinkSync(smallPath); } catch {} }
+        failed++;
+        console.error(`❌ ${category}/${file}: ${e}`);
+      }
+    }
+  }
+
+  console.log(`\nDone. created: ${created}, already present: ${skipped}, failed: ${failed}`);
+  if (failed > 0) process.exit(1);
+}
+
+/**
+ * --summary: Writes docs/images/SUMMARY.md listing each category and the highest
+ * image id ("<id>.avif") in it, one "category:maxnumber" per line. Categories
+ * with no images report 0.
+ */
+function writeSummary() {
+  const FULL_RE = /^(\d+)\.avif$/;
+  const lines = getCategories().map(category => {
+    const dir = path.join(IMAGES_DIR, category);
+    let max = 0;
+    for (const f of fs.readdirSync(dir)) {
+      const m = f.match(FULL_RE);
+      if (m) max = Math.max(max, parseInt(m[1], 10));
+    }
+    return `${category}:${max}`;
+  });
+  const outFile = path.join(IMAGES_DIR, 'SUMMARY.md');
+  fs.writeFileSync(outFile, lines.join('\n') + '\n');
+  console.log(lines.join('\n'));
+  console.log(`\n📝 Wrote ${path.relative(process.cwd(), outFile)}`);
+}
+
 const args = process.argv;
 if (args.includes('--next')) {
   nextSource();
@@ -218,7 +321,11 @@ if (args.includes('--next')) {
   printCategories();
 } else if (args.includes('--process')) {
   processImage();
+} else if (args.includes('--fill-small')) {
+  fillSmall();
+} else if (args.includes('--summary')) {
+  writeSummary();
 } else {
-  console.error('Usage: --next | --cats | --process --source <file> --category <c> [--desc ... --elements ... --colors ... --bg ... --ratio ... --lighting ...]');
+  console.error('Usage: --next | --cats | --fill-small | --summary | --process --source <file> --category <c> [--desc ... --elements ... --colors ... --bg ... --ratio ... --lighting ...]');
   process.exit(1);
 }
