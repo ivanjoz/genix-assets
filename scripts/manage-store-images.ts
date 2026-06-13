@@ -12,6 +12,10 @@ const COUNTER_FILE = path.join(IMAGES_DIR, 'counter.txt');
 const LIST_HEADER =
   '# Ecommerce Images List\n\n| Name | Description | Elements | Dominant Colors | Background | Aspect Ratio | Lighting |\n|------|-------------|----------|-----------------|------------|--------------|----------|\n';
 
+// Spanish companion list: just Name, Description and Elements, translated.
+const LIST_HEADER_ES =
+  '# Lista de Imágenes Ecommerce\n\n| Name | Descripción | Elementos |\n|------|-------------|-----------|\n';
+
 // Conversion settings (AVIF via avifenc, resize via ImageMagick).
 const MAX_PIXELS = 1400000; // 1.4 Megapixels
 const MAX_FILE_SIZE = 200 * 1024; // 200 KB
@@ -59,6 +63,35 @@ function getCategories(): string[] {
 
 function listFileFor(category: string): string {
   return path.join(IMAGES_DIR, category, 'IMAGES_LIST.md');
+}
+
+function listFileEsFor(category: string): string {
+  return path.join(IMAGES_DIR, category, 'IMAGES_LIST.ES.md');
+}
+
+/** Escapes pipes and trims a cell value for a markdown table. */
+function cleanCell(s: string): string {
+  return s.replace(/\|/g, '\\|').trim();
+}
+
+/**
+ * Upserts one row into a markdown list file (seeding the header if absent):
+ * if a row whose first column (Name) equals `id` already exists, that line is
+ * replaced in place; otherwise the row is appended. Keeps the list idempotent
+ * when --process is re-run for an existing id.
+ */
+function appendListRow(listFile: string, header: string, id: number | string, row: string) {
+  let content = fs.existsSync(listFile) ? fs.readFileSync(listFile, 'utf-8') : header;
+  if (content && !content.endsWith('\n')) content += '\n';
+
+  // Match a data row whose first cell is exactly this id, e.g. "| 43 | ...".
+  const rowRe = new RegExp(`^\\|\\s*${String(id)}\\s*\\|.*$`, 'm');
+  if (rowRe.test(content)) {
+    content = content.replace(rowRe, row.replace(/\n$/, ''));
+    fs.writeFileSync(listFile, content.endsWith('\n') ? content : content + '\n');
+    return;
+  }
+  fs.writeFileSync(listFile, content + row);
 }
 
 /** Source files still awaiting processing (image ext, no "<id>--" prefix). */
@@ -167,6 +200,9 @@ function processImage() {
   const background = getArg('--bg');
   const ratio = getArg('--ratio');
   const lighting = getArg('--lighting');
+  // Spanish translations for the IMAGES_LIST.ES.md companion list.
+  const descEs = getArg('--desc-es');
+  const elementsEs = getArg('--elements-es');
 
   if (!source || !category) {
     console.error('❌ Missing required arguments --source and --category');
@@ -221,14 +257,15 @@ function processImage() {
     process.exit(1);
   }
 
-  // 2) Append the metadata row (Name = id).
-  const listFile = listFileFor(category);
-  const clean = (s: string) => s.replace(/\|/g, '\\|').trim();
-  const row = `| ${id} | ${clean(desc)} | ${clean(elements)} | ${clean(colors)} | ${clean(background)} | ${clean(ratio)} | ${clean(lighting)} |\n`;
-  let content = fs.existsSync(listFile) ? fs.readFileSync(listFile, 'utf-8') : LIST_HEADER;
-  if (content && !content.endsWith('\n')) content += '\n';
-  fs.writeFileSync(listFile, content + row);
+  // 2) Append the metadata row (Name = id) to the English list, and a
+  //    translated Name/Description/Elements row to the Spanish companion list.
+  const row = `| ${id} | ${cleanCell(desc)} | ${cleanCell(elements)} | ${cleanCell(colors)} | ${cleanCell(background)} | ${cleanCell(ratio)} | ${cleanCell(lighting)} |\n`;
+  appendListRow(listFileFor(category), LIST_HEADER, id, row);
   console.log(`📝 Documented in ${category}/IMAGES_LIST.md`);
+
+  const rowEs = `| ${id} | ${cleanCell(descEs)} | ${cleanCell(elementsEs)} |\n`;
+  appendListRow(listFileEsFor(category), LIST_HEADER_ES, id, rowEs);
+  console.log(`📝 Documented in ${category}/IMAGES_LIST.ES.md`);
 
   // 3) Mark the source as processed, then bump the counter.
   const markedSource = path.join(SOURCE_DIR, `${id}--${parsed.name}${parsed.ext}`);
@@ -326,6 +363,6 @@ if (args.includes('--next')) {
 } else if (args.includes('--summary')) {
   writeSummary();
 } else {
-  console.error('Usage: --next | --cats | --fill-small | --summary | --process --source <file> --category <c> [--desc ... --elements ... --colors ... --bg ... --ratio ... --lighting ...]');
+  console.error('Usage: --next | --cats | --fill-small | --summary | --process --source <file> --category <c> [--desc ... --elements ... --colors ... --bg ... --ratio ... --lighting ... --desc-es ... --elements-es ...]');
   process.exit(1);
 }
